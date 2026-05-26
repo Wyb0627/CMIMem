@@ -1,0 +1,529 @@
+"""
+Synthetic QA Generation for Dense Session-Level Rewards.
+
+This module generates question-answer pairs for each session to enable
+dense reward computation during ADRPO training.
+
+Supports two modes:
+1. Single-prompt mode (legacy): One LLM call generates all questions
+2. Typed mode (recommended): Independent per-type prompts with few-shot
+   examples, called concurrently for better type diversity and quality.
+"""
+
+import concurrent.futures
+import json
+import re
+from typing import Dict, List, Optional
+
+from config import QA_GENERATION_MODEL
+from prompts import QA_GENERATION_PROMPT
+from prompts_qa_typed import QA_TYPE_PROMPTS, ALL_QA_TYPES
+
+
+class QAGenerator:
+    """Generate synthetic QA pairs for session-level rewards."""
+    
+    def __init__(self, llm_client, num_questions: int = 6):
+        """
+        Initialize QA generator.
+        
+        Args:
+            llm_client: LLM client for generation
+            num_questions: Number of questions to generate per session
+        """
+        self.llm_client = llm_client
+        self.num_questions = num_questions
+    
+    def generate_qa(
+        self,
+        current_session: str,
+        session_timestamp: str,
+        core_memory: str = "",
+        episodic_memories: str = "",
+        semantic_memories: str = "",
+        procedural_memories: str = ""
+    ) -> List[Dict]:
+        """
+        Generate QA pairs for a session.
+        
+        Args:
+            current_session: Current session conversation text
+            session_timestamp: Timestamp of the session
+            core_memory: Current core memory content
+            episodic_memories: Retrieved episodic memories
+            semantic_memories: Retrieved semantic memories
+            procedural_memories: Retrieved procedural memories
+        
+        Returns:
+            List of QA dicts with 'question', 'answer', 'type', 'source'
+        """
+        prompt = QA_GENERATION_PROMPT.format(
+            core_memory=core_memory or "[Empty]",
+            episodic_memories=episodic_memories or "[None]",
+            semantic_memories=semantic_memories or "[None]",
+            procedural_memories=procedural_memories or "[None]",
+            current_session=current_session,
+            session_timestamp=session_timestamp,
+            num_questions=self.num_questions
+        )
+        
+        try:
+            response = self.llm_client.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                response_format={"type": "json_object"}
+            )
+            
+            result = self._parse_json_response(response)
+            questions = result.get("questions", [])
+            
+            # Validate and clean questions
+            validated = []
+            for q in questions:
+                if all(k in q for k in ["question", "answer", "type"]):
+                    validated.append({
+                        "question": q["question"],
+                        "answer": q["answer"],
+                        "type": q.get("type", "single-session-user"),
+                        "source": q.get("source", "current_session")
+                    })
+            
+            # Ensure type diversity
+            validated = self._validate_and_balance(validated)
+            return validated
+            
+        except Exception as e:
+            print(f"QA generation error: {str(e)[:100]}")
+            return []
+
+    # Target question types for balanced QA generation
+    REQUIRED_TYPES = {
+        "single-session-user",
+        "single-session-assistant",
+        "single-session-preference",
+        "temporal-reasoning",
+        "multi-session",
+        "knowledge-update",
+    }
+
+    def _validate_and_balance(self, questions: List[Dict]) -> List[Dict]:
+        """Ensure type distribution is diverse.
+
+        If the LLM generated all questions as the same type (common failure
+        mode), attempt to relabel overflow questions to fill missing types.
+        This is a best-effort fallback; the prompt should handle most cases.
+        """
+        if not questions:
+            return questions
+
+        # Count types present
+        type_counts = {}
+        for q in questions:
+            t = q.get("type", "single-session-user")
+            type_counts[t] = type_counts.get(t, 0) + 1
+
+        existing_types = set(type_counts.keys())
+        missing_types = self.REQUIRED_TYPES - existing_types
+
+        # If we already have good diversity (>=4 types or all present), accept
+        if len(existing_types & self.REQUIRED_TYPES) >= min(len(questions), 5):
+            return questions
+
+        # Find overflow type (most common)
+        overflow_type = max(type_counts, key=type_counts.get)
+        overflow_count = type_counts[overflow_type]
+
+        # Only relabel if there's clear overflow (>1 of same type)
+        if overflow_count <= 1 or not missing_types:
+            return questions
+
+        # Relabel excess questions of the overflow type to fill missing types
+        missing_list = list(missing_types)
+        relabel_idx = 0
+        result = []
+        for q in questions:
+            if (q.get("type") == overflow_type
+                    and type_counts[overflow_type] > 1
+                    and relabel_idx < len(missing_list)):
+                q = dict(q)
+                q["type"] = missing_list[relabel_idx]
+                relabel_idx += 1
+                type_counts[overflow_type] -= 1
+            result.append(q)
+
+        return result
+
+    def generate_qa_typed(
+        self,
+        current_session: str,
+        session_timestamp: str,
+        core_memory: str = "",
+        episodic_memories: str = "",
+        semantic_memories: str = "",
+        procedural_memories: str = "",
+        max_questions: int = 5,
+        max_workers: int = 6,
+    ) -> List[Dict]:
+        """Generate QA pairs using independent per-type prompts concurrently.
+
+        Calls each of the 6 type-specific prompts in parallel. Each prompt
+        can return a valid QA pair or indicate "not_applicable". Keeps at
+        most `max_questions` valid results.
+
+        Args:
+            current_session: Current session conversation text
+            session_timestamp: Timestamp of the session
+            core_memory: Current core memory content
+            episodic_memories: Retrieved episodic memories
+            semantic_memories: Retrieved semantic memories
+            procedural_memories: Retrieved procedural memories
+            max_questions: Maximum number of QA pairs to keep (default: 5)
+            max_workers: Concurrency for API calls (default: 6)
+
+        Returns:
+            List of QA dicts with 'question', 'answer', 'type', 'source'
+        """
+        format_kwargs = {
+            "core_memory": core_memory or "[Empty]",
+            "episodic_memories": episodic_memories or "[None]",
+            "semantic_memories": semantic_memories or "[None]",
+            "procedural_memories": procedural_memories or "[None]",
+            "current_session": current_session,
+            "session_timestamp": session_timestamp,
+        }
+
+        def _call_for_type(qa_type: str) -> Optional[Dict]:
+            """Call LLM for a single QA type. Returns dict or None."""
+            prompt_template = QA_TYPE_PROMPTS[qa_type]
+            prompt = prompt_template.format(**format_kwargs)
+            try:
+                response = self.llm_client.chat_completion(
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7,
+                    response_format={"type": "json_object"},
+                )
+                result = self._parse_json_response(response)
+                # Check if not applicable
+                if result.get("not_applicable"):
+                    return None
+                # Validate required fields
+                if "question" in result and "answer" in result:
+                    return {
+                        "question": result["question"],
+                        "answer": result["answer"],
+                        "type": qa_type,
+                        "source": result.get("source", "current_session"),
+                    }
+                return None
+            except Exception as e:
+                return None
+
+        # Call all 6 types concurrently
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_type = {
+                executor.submit(_call_for_type, qt): qt
+                for qt in ALL_QA_TYPES
+            }
+            for future in concurrent.futures.as_completed(future_to_type):
+                qa_type = future_to_type[future]
+                try:
+                    result = future.result()
+                    if result is not None:
+                        results.append(result)
+                except Exception:
+                    pass
+
+        # Keep at most max_questions results
+        if len(results) > max_questions:
+            # Prioritize diversity: keep one of each type, drop extras
+            results = results[:max_questions]
+
+        return results
+
+    @staticmethod
+    def _parse_json_response(response: str) -> Dict:
+        """Parse JSON even if wrapped in markdown code fences."""
+        if not response:
+            raise ValueError("empty response")
+
+        text = response.strip()
+        m = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+        if m:
+            text = m.group(1).strip()
+        elif text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z0-9_\-]*\s*", "", text)
+            text = re.sub(r"\s*```$", "", text).strip()
+
+        # Fallback: extract outermost JSON object
+        if not text.startswith("{"):
+            b = re.search(r"\{.*\}", text, re.DOTALL)
+            if b:
+                text = b.group(0)
+
+        text = re.sub(r",\s*([\]\}])", r"\1", text)
+        return json.loads(text)
+
+
+def prepare_rl_dataset(
+    conversations: List[Dict],
+    qa_generator: QAGenerator,
+    memory_system
+) -> List[Dict]:
+    """
+    Prepare RL training dataset with synthetic QA pairs.
+    
+    Args:
+        conversations: List of conversation dicts with 'sessions' and 'id'
+        qa_generator: QA generator instance
+        memory_system: Memory system instance
+    
+    Returns:
+        List of training samples with state, session, and QA pairs
+    """
+    rl_data = []
+    
+    for conv in conversations:
+        conv_id = conv.get("id", "unknown")
+        sessions = conv.get("sessions", [])
+        
+        for idx, session in enumerate(sessions):
+            # Get current memory state
+            core_mem = memory_system.core_memory.human
+            
+            # Retrieve relevant memories for context
+            session_text = session.get("text", "")
+            search_result = memory_system.search(session_text, conv_id, top_k=20)
+            retrieved = search_result.get('results', [])
+            
+            # Separate by type
+            episodic = [r["memory"] for r in retrieved if "[EPISODIC]" in r.get("memory", "")]
+            semantic = [r["memory"] for r in retrieved if "[SEMANTIC]" in r.get("memory", "")]
+            procedural = [r["memory"] for r in retrieved if "[PROCEDURAL]" in r.get("memory", "")]
+            
+            # Generate QA pairs
+            qa_pairs = qa_generator.generate_qa(
+                current_session=session_text,
+                session_timestamp=session.get("timestamp", ""),
+                core_memory=core_mem,
+                episodic_memories="\n".join(episodic),
+                semantic_memories="\n".join(semantic),
+                procedural_memories="\n".join(procedural)
+            )
+            
+            # Create training sample
+            rl_data.append({
+                "conversation_id": conv_id,
+                "session_index": idx,
+                "session": session,
+                "state_before": {
+                    "core_memory": core_mem,
+                    "episodic": episodic,
+                    "semantic": semantic,
+                    "procedural": procedural
+                },
+                "questions": qa_pairs
+            })
+            
+            # Process session to update memory state
+            messages = session.get("messages", [])
+            if messages:
+                memory_system.add(
+                    messages, 
+                    user_id=conv_id,
+                    metadata={"timestamp": session.get("timestamp")}
+                )
+    
+    return rl_data
+
+
+def generate_qa_from_trajectories(
+    trajectory_dir: str,
+    llm_client,
+    num_questions: int = 5,
+    output_path: str = None
+) -> List[Dict]:
+    """
+    Generate QA pairs from pre-computed expert trajectories.
+    
+    This function reads trajectory data (agent_calls.jsonl) and memory states,
+    then generates QA pairs for each session using the QAGenerator.
+    
+    Args:
+        trajectory_dir: Path to trajectory directory containing agent_calls.jsonl
+        llm_client: LLM client for QA generation
+        num_questions: Number of questions per session
+        output_path: Optional output path for rl_training_data.jsonl
+    
+    Returns:
+        List of RL training samples with QA pairs
+    """
+    import os
+    from pathlib import Path
+    
+    trajectory_dir = Path(trajectory_dir)
+    output_path = output_path or trajectory_dir / "rl_training_data.jsonl"
+    
+    # Load trajectory data
+    agent_calls_path = trajectory_dir / "agent_calls.jsonl"
+    if not agent_calls_path.exists():
+        raise FileNotFoundError(f"agent_calls.jsonl not found in {trajectory_dir}")
+    
+    with open(agent_calls_path, 'r') as f:
+        calls = [json.loads(line) for line in f if line.strip()]
+    
+    # Group by session
+    sessions = {}
+    for call in calls:
+        idx = call.get("session_index", 0)
+        if idx not in sessions:
+            sessions[idx] = {"input": call.get("input", {}), "state_path": None}
+        # Use state_before_path to locate the states directory.
+        # For session N, the memory state AFTER processing = state_{N+1}.
+        if call.get("agent_type") == "core":
+            sbp = call.get("state_before_path", "")
+            if sbp:
+                # sbp is a path like ".../states/state_N", derive state_{N+1}
+                state_before = Path(sbp)
+                states_dir = state_before.parent
+                state_after = states_dir / f"state_{idx + 1}"
+                # sbp may already be relative from CWD; try direct first,
+                # then fall back to joining with trajectory_dir
+                if not state_after.exists() and not state_after.is_absolute():
+                    candidate = trajectory_dir / state_after
+                    if candidate.exists():
+                        state_after = candidate
+                sessions[idx]["state_path"] = state_after
+    
+    # Load metadata
+    metadata_path = trajectory_dir / "metadata.json"
+    conv_id = "unknown"
+    if metadata_path.exists():
+        with open(metadata_path, 'r') as f:
+            conv_id = json.load(f).get("conv_id", "unknown")
+    
+    # Initialize QA generator
+    qa_gen = QAGenerator(llm_client, num_questions=num_questions)
+    
+    # Process sessions
+    results = []
+    for idx in sorted(sessions.keys()):
+        sess = sessions[idx]
+        inp = sess["input"]
+        new_sess = inp.get("new_session", {})
+        messages = new_sess.get("messages", [])
+        timestamp = new_sess.get("timestamp", "")
+        session_text = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+        
+        # Load state
+        state = {"core_memory": "", "episodic": [], "semantic": [], "procedural": []}
+        state_path = sess.get("state_path")
+        if state_path and state_path.exists():
+            core_path = state_path / "core_memory.json"
+            if core_path.exists():
+                with open(core_path) as f:
+                    state["core_memory"] = json.load(f).get("human", "")
+            
+            payload_path = state_path / "vector_store" / "payload.json"
+            if payload_path.exists():
+                with open(payload_path) as f:
+                    for mem in json.load(f).get("memories", []):
+                        if "[EPISODIC]" in mem:
+                            state["episodic"].append(mem)
+                        elif "[SEMANTIC]" in mem:
+                            state["semantic"].append(mem)
+                        elif "[PROCEDURAL]" in mem:
+                            state["procedural"].append(mem)
+        
+        print(f"  Session {idx+1}/{len(sessions)}...", end=" ", flush=True)
+        
+        # Generate QA pairs
+        qa_pairs = qa_gen.generate_qa(
+            current_session=session_text,
+            session_timestamp=timestamp,
+            core_memory=state.get("core_memory", ""),
+            episodic_memories="\n".join(state.get("episodic", [])),
+            semantic_memories="\n".join(state.get("semantic", [])),
+            procedural_memories="\n".join(state.get("procedural", []))
+        )
+        print(f"got {len(qa_pairs)} questions")
+        
+        results.append({
+            "conversation_id": conv_id,
+            "session_index": idx,
+            "session": {"messages": messages, "timestamp": timestamp},
+            "state_after": state,
+            "questions": qa_pairs
+        })
+    
+    # Save results
+    with open(output_path, 'w') as f:
+        for r in results:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    
+    total_q = sum(len(r["questions"]) for r in results)
+    print(f"\nDone! {len(results)} sessions, {total_q} QA pairs -> {output_path}")
+    
+    return results
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+    
+    parser = argparse.ArgumentParser(
+        description="Generate QA pairs from expert trajectories for RL training"
+    )
+    parser.add_argument(
+        "--trajectory-dir", required=True,
+        help="Path to trajectory directory containing agent_calls.jsonl"
+    )
+    parser.add_argument(
+        "--model", default="gpt-4o",
+        help="Model for QA generation (default: gpt-4o)"
+    )
+    parser.add_argument(
+        "--num-questions", type=int, default=5,
+        help="Number of questions per session (default: 5)"
+    )
+    parser.add_argument(
+        "--output", default=None,
+        help="Output path (default: rl_training_data.jsonl in trajectory dir)"
+    )
+    parser.add_argument(
+        "--api-key", default=None,
+        help="API key for LLM service"
+    )
+    parser.add_argument(
+        "--base-url", default=None,
+        help="Base URL for OpenAI-compatible API"
+    )
+    args = parser.parse_args()
+    
+    # Import LLM client
+    try:
+        from llm_client_internal import OpenAIClient
+    except ImportError:
+        from llm_client import OpenAIClient
+    
+    # Initialize client
+    llm_client = OpenAIClient(
+        api_key=args.api_key or os.environ.get("OPENAI_API_KEY"),
+        base_url=args.base_url or os.environ.get("OPENAI_BASE_URL"),
+        model=args.model
+    )
+    
+    print("=" * 60)
+    print("QA Generation from Expert Trajectories")
+    print("=" * 60)
+    print(f"Trajectory dir: {args.trajectory_dir}")
+    print(f"Model: {args.model}")
+    print(f"Questions per session: {args.num_questions}")
+    print("=" * 60)
+    
+    generate_qa_from_trajectories(
+        trajectory_dir=args.trajectory_dir,
+        llm_client=llm_client,
+        num_questions=args.num_questions,
+        output_path=args.output
+    )

@@ -1,0 +1,84 @@
+# =============================================================================
+# Embedding backend configuration for CMI-Mem.
+#
+# Two backends are supported:
+#
+#   provider: remote
+#     Use the OpenAI-compatible HTTP endpoint configured via OPENAI_EMBEDDINGS_*
+#     env vars (e.g. text-embedding-3-large). Auto-batched to honor the
+#     provider's batch cap.
+#
+#   provider: local
+#     Run a sentence-transformers model on a local GPU. Recommended when the
+#     remote API has tight rate/batch limits and you have a spare GPU. The
+#     model is loaded once per process.
+#
+# This file is the single source of truth for embedding config.
+# build_rl_data.sh / data prep scripts read it and export the corresponding
+# env vars. Override any field via env var of the same uppercase name (e.g.
+# EMBEDDING_PROVIDER=local) -- env always wins over yaml.
+# =============================================================================
+
+# 'remote' (OpenAI-compatible HTTP) or 'local' (GPU via sentence-transformers).
+provider: ${EMBEDDING_PROVIDER:-local}
+
+# ---------------------------------------------------------------------------
+# Remote backend (only used when provider=remote)
+# ---------------------------------------------------------------------------
+remote:
+  # Embedding model name as known by the API endpoint.
+  # OpenAI: text-embedding-3-small / text-embedding-3-large
+  model: ${REMOTE_EMBEDDING_MODEL:-text-embedding-3-small}
+  # Many providers cap batch size (e.g. 10 or 2048). Adjust per your endpoint.
+  batch_size: ${REMOTE_EMBEDDING_BATCH_SIZE:-10}
+
+# ---------------------------------------------------------------------------
+# Local backend (only used when provider=local)
+# ---------------------------------------------------------------------------
+local:
+  # Local model path or HF/ModelScope repo id. Recommended choices
+  # (ranked by quality on a single A100/A800):
+  #   Qwen/Qwen3-Embedding-8B    (4096-dim, ~17GB, top quality)
+  #   Qwen/Qwen3-Embedding-4B    (2560-dim, ~9GB,  best quality / size)
+  #   Qwen/Qwen3-Embedding-0.6B  (1024-dim, ~1.5GB, fastest)
+  #
+  # Use an absolute path to a pre-downloaded snapshot when running offline.
+  model: ${EMBEDDING_MODEL_PATH:-./models/embedding}
+
+  # GPU device. 'cuda' = first available GPU, 'cuda:1' = second, 'cpu' fallback.
+  device: ${LOCAL_EMBEDDING_DEVICE:-cuda}
+
+  # Per-call batch size for the local model. Tune to your GPU memory.
+  batch_size: ${LOCAL_EMBEDDING_BATCH_SIZE:-128}
+
+  # Where ModelScope/HF caches checkpoints. Leave empty for default cache dir.
+  cache_dir: ${EMBEDDING_CACHE_DIR:-}
+
+  # If true (and modelscope/huggingface_hub is installed), the snapshot will
+  # be auto-downloaded on first use. Set false to fail fast when the path is
+  # wrong (no silent re-download).
+  auto_download: ${EMBEDDING_AUTO_DOWNLOAD:-false}
+
+# ---------------------------------------------------------------------------
+# CMI Kernel MI embedding (dedicated model for reward computation).
+#
+# The kernel_mi CMI method can optionally use a SEPARATE (larger) embedding
+# model to encode memory items during RL reward computation, independent
+# of the model configured above which is used for data preparation /
+# memory retrieval.
+#
+# To use a dedicated model set the env var CMI_KERNEL_MI_EMBEDDING_MODEL or
+# the corresponding key in cmi_reward_config.json. If empty, the kernel_mi
+# method falls back to the global embedding model configured above.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Worker count hint (consumed by data prep scripts).
+# For local GPU embedding on a SINGLE GPU, multiple workers don't help -- they
+# would each load their own model copy and serialize on the same device. Use
+# WORKERS=1 with a large batch_size for best single-GPU throughput. The remote
+# backend benefits from concurrency since it parallelizes network I/O.
+# ---------------------------------------------------------------------------
+workers:
+  remote: ${REMOTE_EMBEDDING_WORKERS:-4}
+  local: ${LOCAL_EMBEDDING_WORKERS:-1}

@@ -1,0 +1,125 @@
+# =============================================================================
+# CMI-Mem GRPO training configuration (verl / Hydra).
+#
+# Generic, cluster-agnostic GRPO training config. All paths are parameterized
+# via OmegaConf env resolvers so they can be supplied at launch time:
+#
+#   DATA_DIR                Root directory for training data (parquet files).
+#   MODEL_DIR               Base / SFT checkpoint path or HF/ModelScope repo id.
+#   OUTPUT_DIR              Root directory for checkpoints and logs.
+#   JOB_NAME                Run name; used as the experiment subdir.
+#
+# Reward / CMI knobs are read from environment variables by reward_function.py:
+#   MEMBUILDER_REWARD_MODE  cmi (default) | cmi_plus_qa | qa | membuilder_qa
+#   CMI_METHOD              embedding | logprob | kernel_mi | residual_projection
+#   CMI_SHAPING             gaussian (default) | threshold
+#   CMI_WEIGHT              alpha in cmi_plus_qa mode (default: 0.5)
+#
+# @package _global_
+# =============================================================================
+defaults:
+  - ppo_trainer
+  - _self_
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  # Pre-built RL parquet (see scripts/prepare_rl_data_online.py and
+  # scripts/reorder_rl_data_curriculum.py for curriculum ordering).
+  train_files: ${oc.env:TRAIN_DATA,${oc.env:DATA_DIR,./data}/longmemeval/longmemeval_4agent_rl.parquet}
+  # Disable verl-native validation; LongMemEval QA evaluation is run manually
+  # on saved checkpoints via eval/runner.py.
+  val_files: null
+  train_batch_size: 32
+  max_prompt_length: 24000
+  max_response_length: 8192
+  filter_overlong_prompts: true
+  truncation: left
+  trust_remote_code: true
+  # Preserve curriculum ordering when train_files is curriculum-ordered.
+  shuffle: false
+  apply_chat_template_kwargs:
+    enable_thinking: false
+
+# ── Model & Actor / Rollout / Ref ─────────────────────────────────────────────
+actor_rollout_ref:
+  model:
+    # Either a base model (e.g. Qwen/Qwen3-4B-Instruct-2507) or an SFT
+    # checkpoint produced by `bash scripts/run_training.sh sft`.
+    path: ${oc.env:MODEL_DIR,Qwen/Qwen3-4B-Instruct-2507}
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+    trust_remote_code: true
+  actor:
+    strategy: fsdp
+    optim:
+      lr: 1.0e-6
+    ppo_epochs: 1
+    ppo_mini_batch_size: 32
+    ppo_micro_batch_size_per_gpu: 4
+    use_kl_loss: true
+    kl_loss_coef: 0.02
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0.0
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+    checkpoint:
+      save_contents: ['model', 'optimizer', 'extra', 'hf_model']
+  rollout:
+    name: vllm
+    n: 8
+    temperature: 1.0
+    top_p: 0.95
+    dtype: bfloat16
+    log_prob_micro_batch_size_per_gpu: 4
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.85
+    max_num_batched_tokens: 34000
+    max_model_len: 34000
+    enable_chunked_prefill: false
+  ref:
+    log_prob_micro_batch_size_per_gpu: 4
+    fsdp_config:
+      param_offload: true
+
+# ── Critic (GRPO does not use a critic) ──────────────────────────────────────
+critic:
+  model:
+    path: ${actor_rollout_ref.model.path}
+  optim:
+    lr: 5.0e-5
+  ppo_micro_batch_size_per_gpu: 2
+
+# ── Algorithm (GRPO) ──────────────────────────────────────────────────────────
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
+  kl_ctrl:
+    kl_coef: 0.001
+
+# ── Reward model (disabled; we use a custom reward function) ─────────────────
+reward_model:
+  enable: false
+  reward_manager: batch
+
+# ── Custom reward function (CMI / QA reward driven by env vars) ──────────────
+custom_reward_function:
+  path: training/reward_server/reward_function.py
+  name: compute_score_batch
+
+# ── Trainer ───────────────────────────────────────────────────────────────────
+trainer:
+  logger:
+    - console
+    - file
+  val_before_train: false
+  critic_warmup: 0
+  save_freq: 10
+  test_freq: -1
+  total_epochs: 1
+  project_name: cmi_mem_grpo
+  experiment_name: ${oc.env:JOB_NAME,cmi_mem_grpo}
+  default_local_dir: ${oc.env:OUTPUT_DIR,./outputs}/rl/${trainer.project_name}/${trainer.experiment_name}
+  default_hdfs_dir: null
+  resume_mode: disable
