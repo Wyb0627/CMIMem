@@ -288,21 +288,6 @@ In agentic mode, the policy interacts with the memory store turn-by-turn. Each t
 
 ---
 
-## Citation
-
-This work is currently under double-blind peer review. A citation entry will be added upon acceptance.
-
-```bibtex
-@article{cmi_mem_anonymous,
-  title  = {Action-Conditioned Conditional Mutual Information for Memory-Augmented LLM Training},
-  author = {Anonymous},
-  year   = {2026},
-  note   = {Under review}
-}
-```
-
----
-
 ## License
 
 Released under the MIT License. See [LICENSE](./LICENSE) for the full text.
