@@ -1,0 +1,10 @@
+# Agent loop registration for MemBuilder agentic RL.
+#
+# This file is referenced by the training YAML via:
+#   actor_rollout_ref.rollout.agent.agent_loop_config_path
+#
+# Each entry registers an AgentLoopBase subclass. The 'name' must match
+# the @register("name") decorator in the Python implementation.
+
+- name: memory_builder_agent
+  _target_: training.agentic.agent_loop.MemoryBuilderAgentLoop

@@ -1,0 +1,33 @@
+{
+    "task_reward_mode": "api",
+    "reward_mode": "membuilder_qa",
+    "memory_api_url": "http://localhost:8765",
+    "reward_max_concurrent": 8,
+    "reward_log_dir": "./logs/reward_logs",
+
+    "inproc_base_url": "${LLM_BASE_URL}",
+    "inproc_answer_model": "deepseek-v4-pro",
+    "inproc_judge_model": "deepseek-v4-pro",
+    "inproc_embedding_model": "text-embedding-v4",
+    "inproc_qa_per_session": 5,
+    "inproc_max_concurrent": 8,
+
+    "enable_expert_length_penalty": true,
+    "expert_length_penalty_weight": 0.3,
+
+    "core_length_start_penalty": 150,
+    "core_length_max_penalty": 400,
+
+    "other_length_upper_tolerance": 1.3,
+    "other_length_upper_max_ratio": 2.0,
+    "other_length_lower_tolerance": 0.5,
+    "other_length_lower_min_ratio": 0.2,
+    "other_length_min_diff_tokens": 200,
+
+    "enable_attribution_weighting": true,
+    "attribution_boost_factor": 4.0,
+
+    "enable_sparse_reward_ablation": false,
+    "sparse_reward_drop_rate": 0.0,
+    "sparse_reward_default": 0.5
+}

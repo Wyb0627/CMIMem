@@ -1,0 +1,21 @@
+{
+    "cmi_method": "embedding",
+    "cmi_shaping": "gaussian",
+    "cmi_gaussian_mu": 0.35,
+    "cmi_gaussian_sigma": 0.15,
+    "cmi_gaussian_scale": 1.0,
+    "logprob_eval_max_tokens": 200,
+    "kernel_mi_bandwidth": "auto",
+    "kernel_mi_top_k": 20,
+    "kernel_mi_type_weights": {
+        "core": 0.5,
+        "episodic": 0.2,
+        "semantic": 0.2,
+        "procedural": 0.1
+    },
+    "kernel_mi_normalize": true,
+    "kernel_mi_embedding_model": "",
+    "kernel_mi_embedding_batch_size": 64,
+    "kernel_mi_min_samples": 3,
+    "cmi_debug": false
+}
