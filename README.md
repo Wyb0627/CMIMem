@@ -97,18 +97,9 @@ Switch via the `ROLLOUT_MODE` environment variable; the two modes are completely
 
 ---
 
-## 2. Differences from Original MemBuilder
+## 2. Code Backbone
 
-| Dimension | Original MemBuilder | This Repository |
-|---|---|---|
-| **Reward Signal** | QA judge (external LLM evaluates memory answer quality) | Action-Conditioned Local CMI (no external judge needed) |
-| **Agent Architecture** | 4 independent agents generating separately (core/episodic/semantic/procedural) | Unified model single output + Agentic RL multi-turn |
-| **Credit Assignment** | Scalar task_reward broadcast to all agents | Per-action CMI reward, dense per-turn |
-| **Expert Trajectory** | Required (for both SFT and RL data) | Not required in Agentic mode |
-| **LLM Backend** | Claude / OpenAI | DashScope (`deepseek-v4-pro` + `Qwen3-Embedding-4B`) |
-| **Training Cluster** | Local Ray | Local / custom cluster (verl-based) |
-| **Reward Computation** | External HTTP reward server | In-process (worker process directly connects to DashScope) |
-| **Embedding** | Remote API (text-embedding-v4) | Local GPU model (`Qwen3-Embedding-4B`), avoids rate-limiting |
+Our code is built based on the original version of [MemBuilder](https://github.com/Zh1yuShen/MemBuilder/tree/main).
 
 ---
 
