@@ -451,10 +451,10 @@ MemBuilder/
 ## 10. Citation
 
 ```bibtex
-@article{membuilder2025,
-  title={MemBuilder: Building Long-Term Memory with Conditional Mutual Information Rewards},
+@article{cmimem2026,
+  title={CMI-Mem: A CMI-Driven Reinforcement Learning Framework for Long-term Memory Management},
   author={...},
-  year={2025}
+  year={2026}
 }
 ```
 
