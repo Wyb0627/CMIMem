@@ -3,12 +3,14 @@
 [![arXiv](https://img.shields.io/badge/arXiv-Coming%20Soon-red)]()
 [![ModelScope](https://img.shields.io/badge/ModelScope-CMIMem--4B-blue)]()
 
-A long-term memory construction framework built upon [MemBuilder (ACL 2026)](https://arxiv.org/abs/2601.05488), with two core improvements:
+A long-term memory construction framework with two core contributions:
 
 1. **Action-Conditioned Local CMI Reward**: Replaces the QA judge with Conditional Mutual Information as the RL reward signal, enabling dense rewards without requiring expert trajectories.
 2. **Agentic RL Training Framework**: Transforms the 4-agent batch rollout into a multi-turn agent loop, computing per-action CMI rewards for fine-grained credit assignment.
 
 This repository provides the core memory system, evaluation framework, and data preparation tools for local development and experimentation. Training is based on the **[verl](https://github.com/volcengine/verl)** framework with the GRPO algorithm.
+
+Our model checkpoint trained with LongMemEval_s_cleaned dataset is released at [Coming Soon]()
 
 ---
 
