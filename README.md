@@ -1,4 +1,4 @@
-# CMI-Mem · MemBuilder + Action-Conditioned CMI Reward + Agentic RL
+# CMI-Mem: A CMI-Driven Reinforcement Learning Framework for Long-term Memory Management
 
 [![arXiv](https://img.shields.io/badge/arXiv-Coming%20Soon-red)]()
 [![ModelScope](https://img.shields.io/badge/ModelScope-CMIMem--4B-blue)]()
