@@ -1,7 +1,7 @@
 # CMI-Mem · MemBuilder + Action-Conditioned CMI Reward + Agentic RL
 
 [![arXiv](https://img.shields.io/badge/arXiv-Coming%20Soon-red)]()
-[![ModelScope](https://img.shields.io/badge/ModelScope-CMIMem--4B-blue)](https://www.modelscope.cn/models/wyb0627/CMIMem-4B)
+[![ModelScope](https://img.shields.io/badge/ModelScope-CMIMem--4B-blue)]()
 
 A long-term memory construction framework built upon [MemBuilder (ACL 2026)](https://arxiv.org/abs/2601.05488), with two core improvements:
 
