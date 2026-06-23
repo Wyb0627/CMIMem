@@ -39,7 +39,7 @@ from openai import OpenAI
 #     LLM_RETRY_MAX_DELAY_S    default 60  cap per-attempt sleep
 #     LLM_RETRY_JITTER_FRAC    default 0.3 random jitter as fraction of delay
 # These bounds give a worst-case wall time of ~1+2+4+8+16+32 = 63s of sleeping
-# before giving up, which is well below the typical RPM window. The
+# before giving up, which is well below DashScope's typical RPM window. The
 # outer _retry_with_json_validation in memory_system.py still wraps this with
 # its own (now mostly dormant) retry budget, so a single 429 storm can't kill
 # the whole conv.
@@ -79,10 +79,67 @@ def _is_retryable_api_error(exc: BaseException) -> bool:
     return False
 
 
+# Context-length error patterns. We match against str(exc) because:
+# - openai SDK BadRequestError stores the server's JSON body in the message
+# - vLLM returns: "'max_tokens' or 'max_completion_tokens' is too large: 8192"
+# - DashScope/OpenAI return: "context_length_exceeded" or "maximum context length"
+_CONTEXT_LENGTH_PATTERNS = (
+    "max_completion_tokens' is too large",
+    "context_length_exceeded",
+    "maximum context length",
+)
+
+
+def _is_context_length_error(exc: BaseException) -> bool:
+    """Return True iff this exception represents a context-length-exceeded
+    error (prompt + max_tokens > model's capacity).
+
+    We only treat 400-level (or unset status) errors as context-length errors;
+    a 429 with a similar message would still be a rate-limit, not a sizing
+    issue. Matching is on the rendered string because the OpenAI SDK embeds
+    the upstream JSON body there.
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and (status == 429 or 500 <= status < 600):
+        return False
+    msg = str(exc).lower()
+    return any(pat.lower() in msg for pat in _CONTEXT_LENGTH_PATTERNS)
+
+
+def _is_local_vllm_endpoint(base_url: Optional[str]) -> bool:
+    """Heuristic: treat localhost / 127.0.0.1 / port 8000 as our local
+    vLLM (memory-builder) endpoint. We deliberately skip context-length
+    fallback there, because:
+    - Truncating messages for the memory-construction prompt would feed
+      the model an incomplete view and produce noisy/wrong memories
+    - Memory build has its own, smarter top-k-degradation fallback in
+      memory_system.py that's aware of prompt structure
+    """
+    if not base_url:
+        return False
+    b = base_url.lower()
+    return ("localhost" in b) or ("127.0.0.1" in b) or (":8000" in b)
+
+
+def _truncate_messages_middle(messages: List[Dict[str, str]]) -> Optional[List[Dict[str, str]]]:
+    """Drop middle messages, keeping the first (system prompt) and the last
+    (current user turn). Returns None if no shorter list is possible
+    (i.e. already <=2 messages or already at minimum).
+
+    The first message is preserved because it typically holds the system
+    prompt that defines the role/task. The last message is preserved
+    because it is the most recent user turn — usually the question that
+    the model needs to answer. Middle history is what gets sacrificed.
+    """
+    if len(messages) <= 2:
+        return None
+    return [messages[0], messages[-1]]
+
+
 def _retry_after_seconds(exc: BaseException) -> Optional[float]:
     """Extract Retry-After hint from a 429 response if the server provided one.
 
-    Many providers populate the ``retry-after`` header on
+    DashScope (and OpenAI proper) populate the ``retry-after`` header on
     429s. Honor it as a *lower bound* on our sleep, capped at MAX_DELAY_S.
     """
     try:
@@ -149,7 +206,7 @@ def _retry_with_backoff(fn, *, op_name: str = "llm_api"):
 # Local embedding backend (optional)
 # =============================================================================
 # When the chat provider is fine but the embedding API has tight rate/batch
-# limits (e.g. some API providers allow only batch<=10), you can
+# limits (e.g. DashScope text-embedding-v* allows only batch<=10), you can
 # offload embeddings to a local GPU model via sentence-transformers.
 #
 # Activate by setting (or via configs/embedding.yaml + build_rl_data_*.sh):
@@ -166,7 +223,7 @@ def _retry_with_backoff(fn, *, op_name: str = "llm_api"):
 #      to fetch onto local disk, then load the resulting directory.
 #      ModelScope is used instead of HuggingFace because the runtime hosts
 #      cannot reach huggingface.co; ModelScope mirrors the same checkpoints
-#      on cloud-internal infra.
+#      on Aliyun-internal infra.
 #
 # The model is loaded once per process (lazily on first use) and shared across
 # all LLMClient instances to avoid wasting GPU memory.
@@ -178,7 +235,7 @@ _LOCAL_EMBEDDER_LOCK = threading.Lock()
 def _resolve_local_model_path(model_ref, auto_download=True, cache_dir=None):
     """Resolve a model reference (local dir or ModelScope id) to a local path.
 
-    We never go through HuggingFace -- cloud runtime can't reach it.
+    We never go through HuggingFace by default.
     """
     # Already a usable local directory? (e.g. user pre-downloaded snapshot)
     if model_ref and os.path.isdir(model_ref):
@@ -196,7 +253,7 @@ def _resolve_local_model_path(model_ref, auto_download=True, cache_dir=None):
     except ImportError as e:
         raise ImportError(
             "Auto-downloading local embedding models requires the `modelscope` "
-            "package (HuggingFace is unreachable on cloud runtime). "
+            "package. "
             "Install via: pip install modelscope"
         ) from e
 
@@ -345,9 +402,9 @@ class LLMClient:
             embedding_model: Default embedding model name. If None, falls
                 back to the ``EMBEDDING_MODEL`` env var (set by build scripts
                 from configs/embedding.yaml). If still unset, uses
-                ``text-embedding-v4`` (current default), NOT the
+                ``text-embedding-v4`` (DashScope's current default), NOT the
                 old OpenAI-only ``text-embedding-3-small`` -- the latter 404s
-                on some providers and was the silent default for callers that
+                on DashScope and was the silent default for callers that
                 bypass build_rl_data_s_cleaned.sh.
         """
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
@@ -412,12 +469,12 @@ class LLMClient:
         if response_format:
             request_kwargs["response_format"] = response_format
 
-        # Disable thinking mode for thinking models (DeepSeek-V4,
+        # Disable thinking mode for DashScope thinking models (DeepSeek-V4,
         # Qwen3, etc.) unless the caller explicitly opted in. Thinking mode
         # adds latency, cost, and can interfere with JSON output.
         if "extra_body" not in request_kwargs:
             base = (self.base_url or "").lower()
-            if "dashscope" in base or "deepseek" in base:
+            if "dashscope" in base:
                 request_kwargs["extra_body"] = {"enable_thinking": False}
 
         # Adaptive backoff on 429 / 5xx / timeouts / conn drops. The
@@ -438,9 +495,36 @@ class LLMClient:
             # it and retry once. If that still fails, propagate.
             if "response_format" in request_kwargs and not _is_retryable_api_error(e):
                 request_kwargs.pop("response_format", None)
-                response = _do_call(request_kwargs)
-            else:
-                raise
+                try:
+                    response = _do_call(request_kwargs)
+                except Exception as e2:
+                    e = e2  # fall through to context-length check below
+                else:
+                    e = None
+
+            if e is not None:
+                # Context-length fallback: only for non-vLLM endpoints.
+                # Memory-build vLLM gets its own structure-aware fallback
+                # in memory_system.py.
+                if (
+                    _is_context_length_error(e)
+                    and not _is_local_vllm_endpoint(self.base_url)
+                ):
+                    truncated = _truncate_messages_middle(request_kwargs["messages"])
+                    if truncated is not None:
+                        old_count = len(request_kwargs["messages"])
+                        new_count = len(truncated)
+                        print(
+                            f"  ⚠️ context length exceeded, truncating messages "
+                            f"from {old_count} to {new_count}",
+                            flush=True,
+                        )
+                        request_kwargs["messages"] = truncated
+                        response = _do_call(request_kwargs)
+                    else:
+                        raise e
+                else:
+                    raise e
         raw_content = response.choices[0].message.content
         content = self._normalize_message_content(raw_content)
 
@@ -473,7 +557,7 @@ class LLMClient:
           - If ``EMBEDDING_PROVIDER=local``, embeddings are computed by a local
             sentence-transformers model (loaded once per process). Useful when
             chat uses a remote API but the embedding API has tight rate/batch
-            limits (e.g. some providers cap batch at 10).
+            limits (e.g. DashScope text-embedding-v* caps batch at 10).
           - Otherwise (default), embeddings are fetched from the OpenAI-compatible
             endpoint configured on this client, with auto-batching.
 
@@ -514,9 +598,14 @@ class LLMClient:
         for start in range(0, len(texts), batch_size):
             chunk = texts[start:start + batch_size]
             response = _retry_with_backoff(
-                lambda c=chunk: self.client.embeddings.create(input=c, model=model),
+                lambda c=chunk: self.client.embeddings.create(input=c, model=model, encoding_format="float"),
                 op_name="embeddings",
             )
+            if not response.data:
+                raise ValueError(
+                    f"Embedding service returned empty data "
+                    f"(batch {start//batch_size + 1}, chunk_size={len(chunk)})"
+                )
             all_embeddings.extend(item.embedding for item in response.data)
         return all_embeddings
 

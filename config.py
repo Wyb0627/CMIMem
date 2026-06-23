@@ -29,7 +29,7 @@ QA_GENERATION_MODEL = os.environ.get("QA_GENERATION_MODEL", "deepseek-v4-pro")
 # Answer model for RL reward and QA generation
 ANSWER_MODEL = os.environ.get("ANSWER_MODEL", "deepseek-v4-pro")
 
-# LLM Judge model for evaluation (deepseek-v4-pro)
+# LLM Judge model for evaluation (DashScope deepseek-v4-pro)
 JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "deepseek-v4-flash")
 
 # Embedding model for retrieval (env override for non-OpenAI providers)
@@ -118,7 +118,7 @@ CMI_WEIGHT = float(os.environ.get("CMI_WEIGHT", "0.5"))
 # Comma-separated list of memory types: "episodic", "semantic", "procedural", "core".
 # Empty string = disabled (pure memory mode, backward compatible).
 # Example: RAG_CHUNK_TYPES="episodic|semantic"
-# Uses "|" as delimiter (not comma) to avoid conflicts with cluster ENV_VARS parsing.
+# Uses "|" as delimiter (not comma) to avoid conflicts with nebula ENV_VARS parsing.
 RAG_CHUNK_TYPES = [t.strip() for t in os.environ.get("RAG_CHUNK_TYPES", "").split("|") if t.strip()]
 
 # Number of turns (messages) per chunk when splitting session conversations.

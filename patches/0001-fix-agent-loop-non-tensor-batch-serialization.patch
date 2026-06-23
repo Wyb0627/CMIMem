@@ -1,0 +1,30 @@
+From: CMI-Mem Contributors
+Subject: [PATCH] Fix non_tensor_batch serialization for complex objects in AgentLoopWorker
+
+In AgentLoopWorker, the original code uses `np.array([v])` to wrap kwargs
+values into numpy arrays. This fails silently for non-numeric types (dicts,
+lists, custom objects) because numpy tries to create a numeric array and
+either raises or produces incorrect results.
+
+Fix: use `np.empty(1, dtype=object)` with explicit assignment, which
+correctly handles arbitrary Python objects.
+
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -620,10 +620,12 @@ class AgentLoopWorker:
+                     },
+                     batch_size=1,
+                 )
+-                non_tensor_batch = {
+-                    **{k: np.array([v]) for k, v in kwargs.items()},
+-                    "__num_turns__": np.array([output.num_turns]),
+-                }
++                non_tensor_batch = {}
++                for k, v in kwargs.items():
++                    arr = np.empty(1, dtype=object)
++                    arr[0] = v
++                    non_tensor_batch[k] = arr
++                non_tensor_batch["__num_turns__"] = np.array([output.num_turns])
+                 extra_fields = {}
+                 for key, val in output.extra_fields.items():
+                     extra_fields[key] = np.array([val], dtype=object)

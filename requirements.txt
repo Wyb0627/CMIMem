@@ -1,31 +1,30 @@
 # =============================================================================
-# CMI-Mem: Action-Conditioned Conditional Mutual Information for
-# Memory-Augmented LLM Training
+# CMI-Mem: Unified Dependencies
 #
-# Dependency manifest. Two logical groups:
-#   1. Core dependencies   - required for evaluation, inference, data prep,
-#                            and reward computation. CPU-friendly.
-#   2. RL training stack   - required for GRPO reinforcement learning on
-#                            multi-GPU clusters.
+# Covers data preparation, evaluation (LongMemEval / MemoryAgentBench / Mem0),
+# reward computation, and RL training (GRPO via verl).
 #
 # Recommended environment:
 #   - Python >= 3.10
 #   - CUDA >= 12.1 (for GPU training / inference)
 #   - PyTorch >= 2.0 (>= 2.8 recommended for RL training)
+#
+# Install:  pip install -r requirements.txt
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Core Dependencies (Required for evaluation, inference, and data preparation)
+# Core Dependencies (evaluation, inference, data preparation, reward server)
 # -----------------------------------------------------------------------------
 
 # Transformers / PEFT (Qwen3 series support; <5.0 to keep AutoModelForVision2Seq)
 transformers>=4.45.0,<5.0
 peft>=0.19.0
 
-# LLM API clients (OpenAI-compatible endpoints for answer / judge / extractor)
+# LLM API clients (OpenAI-compatible + DashScope)
 openai>=1.0.0
+dashscope>=1.20.0
 
-# Vector retrieval (FAISS in-memory mode for memory bank)
+# Vector retrieval
 faiss-cpu>=1.7.0
 sentence-transformers>=2.2.0
 
@@ -40,7 +39,7 @@ datasets>=2.14.0
 huggingface-hub>=0.20.0
 hf-transfer
 
-# Reward server / lightweight HTTP fallback
+# Reward server / HTTP
 flask>=2.0.0
 requests>=2.0.0
 fastapi[standard]>=0.115.0
@@ -53,11 +52,14 @@ hydra-core
 codetiming
 dill
 
-# Math reasoning utilities (used by judge / metric helpers)
+# Math reasoning utilities (judge / metric helpers)
 latex2sympy2_extended
 math_verify
 mathruler
 pylatexenc
+
+# Local GPU embedding (optional, for offline embedding without API calls)
+modelscope>=1.9.0
 
 # Progress bars / logging / monitoring
 tqdm
@@ -65,13 +67,22 @@ wandb
 tensorboard
 
 # -----------------------------------------------------------------------------
-# RL Training Dependencies (Required for GRPO reinforcement learning)
+# Evaluation Metrics (LongMemEval & MemoryAgentBench)
 # -----------------------------------------------------------------------------
 
-# verl framework (GRPO trainer; install from source if not on PyPI)
+rouge-score
+nltk
+editdistance
+tiktoken
+
+# -----------------------------------------------------------------------------
+# RL Training Dependencies (GRPO via verl)
+# -----------------------------------------------------------------------------
+
+# verl framework (install from source recommended; apply patches/ first)
 verl>=0.3.0
 
-# vLLM rollout backend (>= 0.8.2 required by verl; >= 0.8.4 required by Qwen3)
+# vLLM rollout backend (>= 0.8.2 required by verl; >= 0.8.4 for Qwen3)
 vllm>=0.8.2
 
 # Distributed training / orchestration

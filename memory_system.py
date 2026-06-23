@@ -7,11 +7,9 @@ This module implements the core memory architecture with four specialized agents
 - Semantic Memory: Factual knowledge about entities
 - Procedural Memory: Step-by-step processes and workflows
 
-Note: This implementation uses FAISS for vector storage instead of mem0.
-The original codebase used mem0 (https://github.com/mem0ai/mem0) for memory storage,
-but we provide a standalone FAISS-based VectorStore for simplicity and to avoid
-external dependencies. The memory construction logic (prompts, agents, operations)
-remains the same as described in the paper.
+This implementation uses FAISS for vector storage with a standalone VectorStore
+for simplicity. The memory construction logic (prompts, agents, operations)
+is as described in the paper.
 """
 
 import json
@@ -30,6 +28,7 @@ from prompts import (
     SEMANTIC_MEMORY_PROMPT, PROCEDURAL_MEMORY_PROMPT,
     CORE_MEMORY_COMPRESS_PROMPT, ANSWER_GENERATION_PROMPT
 )
+from llm_client import _is_context_length_error
 
 
 @dataclass
@@ -59,7 +58,7 @@ class VectorStore:
                 lazily from the first batch of embeddings produced by
                 ``embedding_func`` (or restored from disk in ``load``). This
                 avoids hard-coding a specific embedding model's output size
-                (e.g. OpenAI text-embedding-3-small=1536,
+                (e.g. OpenAI text-embedding-3-small=1536, DashScope
                 text-embedding-v4=1024) and prevents FAISS dimension
                 assertion errors when the model is swapped via env vars.
         """
@@ -854,31 +853,18 @@ Supporting Original Conversations:
 {chunk_context}
 """
 
-        # Generate answer with MIRIX-style flexible understanding
+        # Generate answer — aligned with MemoryAgentBench's simple prompt style.
+        # Avoid over-constraining the model (no forced JSON, no aggressive
+        # "Not answerable" guidance) so it answers naturally.
         prompt = f"""{context}{time_context}{chunk_section}
 
 Question: {question}
 
-Instructions:
-1. Carefully analyze the retrieved memories to find relevant information
-2. Consider synonyms and related concepts (e.g., "support group", "activist group" may refer to similar things)
-3. If memories mention specific dates/times, use those to answer time-related questions
-4. If memories contain contradictory information, prioritize the most recent memory
-5. Focus on the content of the memories, not just exact word matches
-
-**For factual questions (What/When/Where/Who):**
-- Answer based on direct information in the memories
-- If the specific fact is not mentioned, respond: "Not answerable"
-
-**For inference/reasoning questions (Would/Could/Likely):**
-- You CAN make reasonable inferences based on related information in the memories
-
-**When to say "Not answerable":**
-- If the question asks about a specific person but the memories are about a DIFFERENT person
-- If the question asks about an event/action that is NOT mentioned in ANY memories
-- If you find information about a similar but DIFFERENT event
-
-Provide a concise, direct answer based on the available information, or state "Not answerable" if the specific information is not present."""
+Answer the question based on the above memories and context. Keep the following in mind:
+- Consider synonyms and related concepts when matching information.
+- If memories contain contradictory information, prioritize the most recent one.
+- You may make reasonable inferences from the available information.
+- Provide a concise, direct answer."""
         
         try:
             return self.llm_client.chat_completion(
@@ -906,12 +892,21 @@ Provide a concise, direct answer based on the available information, or state "N
                 formatted.append(f"[OTHER_ROLE:{role}]: {content}")
         return "\n".join(formatted)
     
-    def _get_existing_memories(self, memory_type: str, user_id: str, 
-                               messages: Optional[List[Dict]] = None) -> List[str]:
-        """Get existing memories of a specific type for context."""
+    def _get_existing_memories(self, memory_type: str, user_id: str,
+                               messages: Optional[List[Dict]] = None,
+                               top_k: Optional[int] = None) -> List[str]:
+        """Get existing memories of a specific type for context.
+
+        Args:
+            top_k: number of memories to retrieve. Defaults to
+                MEMORY_CONSTRUCTION_TOP_K (20). Lower values are used by
+                the context-length-exceeded fallback in agent methods.
+        """
         from config import EMBEDDING_QUERY_MAX_CHARS
         prefix = MEMORY_PREFIXES.get(memory_type, "")
-        
+        if top_k is None:
+            top_k = MEMORY_CONSTRUCTION_TOP_K
+
         # Build search query from messages (take most recent messages, truncated
         # to EMBEDDING_QUERY_MAX_CHARS to avoid sending excessively long text to
         # the embedding service — long queries degrade both latency and retrieval
@@ -933,13 +928,14 @@ Provide a concise, direct answer based on the available information, or state "N
             query = f"{prefix} {query_text}"
         else:
             query = prefix
-        
-        # Use MEMORY_CONSTRUCTION_TOP_K (20) as per paper Appendix
-        search_result = self.search(query, user_id, top_k=MEMORY_CONSTRUCTION_TOP_K)
+
+        search_result = self.search(query, user_id, top_k=top_k)
         results = search_result.get('results', []) if isinstance(search_result, dict) else []
-        
-        # Filter by type and limit to top-20
-        return [r["memory"] for r in results if isinstance(r, dict) and r.get("memory", "").startswith(prefix)][:MEMORY_CONSTRUCTION_TOP_K]
+
+        return [
+            r["memory"] for r in results
+            if isinstance(r, dict) and r.get("memory", "").startswith(prefix)
+        ][:top_k]
     
     def _core_agent(self, messages: List[Dict], user_id: str) -> Tuple[str, str]:
         """Core Memory Agent: Manage persistent user profile (thread-safe)."""
@@ -1016,47 +1012,99 @@ Provide a concise, direct answer based on the available information, or state "N
         result = json.loads(response)
         self.core_memory.human = result.get("content", "")[:CORE_MEMORY_CHAR_LIMIT]
     
-    def _episodic_agent(self, messages: List[Dict], user_id: str, 
+    # Top-k degradation ladder for context-length-exceeded errors during
+    # memory build. We start with the paper-recommended top-k (20) and step
+    # down to 10 then 5 before giving up. Smaller top-k means less existing-
+    # memory context in the prompt, which is the primary contributor to
+    # over-length prompts when sessions are long.
+    _MEMORY_BUILD_TOP_K_LADDER = (None, 10, 5)  # None = use default (20)
+
+    def _run_agent_with_topk_fallback(self, memory_type: str, user_id: str,
+                                       messages: List[Dict],
+                                       render_prompt) -> Tuple[List[str], Dict]:
+        """Run a memory agent, degrading top_k on context-length errors.
+
+        Args:
+            memory_type: "episodic" | "semantic" | "procedural"
+            render_prompt: callable that takes ``existing: List[str]`` and
+                returns the rendered prompt string.
+
+        Falls back through the top-k ladder on context-length errors. Any
+        other exception propagates immediately. If even top_k=5 fails with
+        a context-length error, the final exception is re-raised.
+        """
+        last_exc: Optional[BaseException] = None
+        for top_k in self._MEMORY_BUILD_TOP_K_LADDER:
+            existing = self._get_existing_memories(
+                memory_type, user_id, messages=messages, top_k=top_k,
+            )
+            prompt = render_prompt(existing)
+            try:
+                return self._process_memory_agent(prompt, memory_type)
+            except Exception as e:
+                if not _is_context_length_error(e):
+                    raise
+                effective_k = top_k if top_k is not None else MEMORY_CONSTRUCTION_TOP_K
+                idx = self._MEMORY_BUILD_TOP_K_LADDER.index(top_k)
+                if idx + 1 < len(self._MEMORY_BUILD_TOP_K_LADDER):
+                    next_k = self._MEMORY_BUILD_TOP_K_LADDER[idx + 1]
+                    print(
+                        f"  ⚠️ {memory_type}: context length exceeded with "
+                        f"top_k={effective_k}, retrying with top_k={next_k}",
+                        flush=True,
+                    )
+                last_exc = e
+        # Exhausted ladder.
+        assert last_exc is not None
+        raise last_exc
+
+    def _episodic_agent(self, messages: List[Dict], user_id: str,
                         metadata: Optional[Dict] = None) -> Tuple[List[str], Dict]:
         """Episodic Memory Agent: Extract time-ordered events."""
-        existing = self._get_existing_memories("episodic", user_id, messages)
         formatted_messages = self._format_messages(messages)
         timestamp = metadata.get("timestamp", "Not provided") if metadata else "Not provided"
-        
         template = Template(self.prompts["episodic"])
-        prompt = template.render(
-            existing_episodic="\n".join(existing) or "[No existing memories]",
-            messages=formatted_messages,
-            conversation_timestamp=timestamp
+
+        def _render(existing: List[str]) -> str:
+            return template.render(
+                existing_episodic="\n".join(existing) or "[No existing memories]",
+                messages=formatted_messages,
+                conversation_timestamp=timestamp,
+            )
+
+        return self._run_agent_with_topk_fallback(
+            "episodic", user_id, messages, _render,
         )
-        
-        return self._process_memory_agent(prompt, "episodic")
-    
+
     def _semantic_agent(self, messages: List[Dict], user_id: str) -> Tuple[List[str], Dict]:
         """Semantic Memory Agent: Extract conceptual knowledge."""
-        existing = self._get_existing_memories("semantic", user_id, messages)
         formatted_messages = self._format_messages(messages)
-        
         template = Template(self.prompts["semantic"])
-        prompt = template.render(
-            existing_semantic="\n".join(existing) or "[No existing memories]",
-            messages=formatted_messages
+
+        def _render(existing: List[str]) -> str:
+            return template.render(
+                existing_semantic="\n".join(existing) or "[No existing memories]",
+                messages=formatted_messages,
+            )
+
+        return self._run_agent_with_topk_fallback(
+            "semantic", user_id, messages, _render,
         )
-        
-        return self._process_memory_agent(prompt, "semantic")
-    
+
     def _procedural_agent(self, messages: List[Dict], user_id: str) -> Tuple[List[str], Dict]:
         """Procedural Memory Agent: Extract step-by-step processes."""
-        existing = self._get_existing_memories("procedural", user_id, messages)
         formatted_messages = self._format_messages(messages)
-        
         template = Template(self.prompts["procedural"])
-        prompt = template.render(
-            existing_procedural="\n".join(existing) or "[No existing memories]",
-            messages=formatted_messages
+
+        def _render(existing: List[str]) -> str:
+            return template.render(
+                existing_procedural="\n".join(existing) or "[No existing memories]",
+                messages=formatted_messages,
+            )
+
+        return self._run_agent_with_topk_fallback(
+            "procedural", user_id, messages, _render,
         )
-        
-        return self._process_memory_agent(prompt, "procedural")
     
     def _process_memory_agent(self, prompt: str, memory_type: str) -> Tuple[List[str], Dict]:
         """Process agent response and extract memories with retry and JSON validation."""

@@ -1,0 +1,25 @@
+From: CMI-Mem Contributors
+Subject: [PATCH] Register TrajectoryRewardManager in verl reward manager registry
+
+Adds auto-import of TrajectoryRewardManager from training.agentic.reward_manager
+so that the "trajectory" reward manager name is recognized by verl's registry.
+This is required for Agentic RL training with per-turn dense CMI rewards.
+
+The import is wrapped in try/except so that users who only use batch mode
+(without the agentic module) will not see import errors.
+
+--- a/verl/workers/reward_manager/__init__.py
++++ b/verl/workers/reward_manager/__init__.py
+@@ -18,6 +18,12 @@ from .dapo import DAPORewardManager
+ from .naive import NaiveRewardManager
+ from .prime import PrimeRewardManager
+ 
++# Agentic RL trajectory reward manager (registers "trajectory" in the registry)
++try:
++    from training.agentic.reward_manager import TrajectoryRewardManager  # noqa: F401
++except ImportError:
++    TrajectoryRewardManager = None  # agentic module not available
++
+ # Note(haibin.lin): no need to include all reward managers here in case of complicated dependencies
+ __all__ = [
+     "BatchRewardManager",
