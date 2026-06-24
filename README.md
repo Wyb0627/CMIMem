@@ -1,7 +1,7 @@
 # CMI-Mem: A CMI-Driven Reinforcement Learning Framework for Long-term Memory Management
 
 [![arXiv](https://img.shields.io/badge/arXiv-Coming%20Soon-red)]()
-[![ModelScope](https://img.shields.io/badge/ModelScope-CMIMem--4B-blue)]()
+[![ModelScope](https://img.shields.io/badge/ModelScope-Coming%20Soon-blue)]()
 
 A long-term memory construction framework with two core contributions:
 
