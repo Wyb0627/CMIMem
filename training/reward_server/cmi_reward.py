@@ -1361,6 +1361,13 @@ class ThresholdRewardShaper:
             return self.in_reward * 0.5 - ratio * (self.in_reward * 0.5 - self.out_reward)
 
 
+class NoShaper:
+    """Identity shaper: return raw CMI as reward (no shaping). Used for ablation."""
+
+    def shape(self, cmi: float) -> float:
+        return cmi
+
+
 class GaussianRewardShaper:
     """Gaussian (bell curve) reward shaping.
 
@@ -2675,6 +2682,8 @@ def _get_shaper(shaping: str, config: Dict[str, Any]):
         return ThresholdRewardShaper(config)
     elif shaping == "gaussian":
         return GaussianRewardShaper(config)
+    elif shaping == "none":
+        return NoShaper()
     else:
         print(f"[CMI] Unknown shaping '{shaping}', defaulting to gaussian.")
         return GaussianRewardShaper(config)

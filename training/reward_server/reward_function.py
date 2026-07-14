@@ -272,6 +272,27 @@ def _load_reward_config() -> Dict[str, Any]:
         if val:
             cfg[cfg_key] = str(val).strip()
 
+    _mr1_em = os.environ.get("MEMORY_R1_EM_MODE")
+    if _mr1_em:
+        cfg["memory_r1_em_mode"] = str(_mr1_em).strip().lower()
+    _mr1_qa = os.environ.get("MEMORY_R1_QA_PER_SESSION")
+    if _mr1_qa:
+        try:
+            cfg["memory_r1_qa_per_session"] = int(_mr1_qa)
+        except ValueError:
+            pass
+    _mr1_topk = os.environ.get("MEMORY_R1_TOP_K")
+    if _mr1_topk:
+        try:
+            cfg["memory_r1_top_k"] = int(_mr1_topk)
+        except ValueError:
+            pass
+
+    # Memory-R1 reward is a strictly pure trajectory-level mean-EM scalar (the
+    # paper's coarse reward); never let the length penalty scale it.
+    if str(cfg.get("reward_mode", "")).strip().lower() == "memory_r1":
+        cfg["enable_length_penalty"] = False
+
     # 🔍 强制打印配置（首次加载时）
     if _REWARD_CONFIG is None:
         print(f"\n🔧 [CONFIG] Reward配置加载:")
@@ -730,7 +751,11 @@ def compute_score_batch(
     def process_session(session_id: str, agents_data: Dict) -> Dict[str, Dict]:
         """Process single session, return {agent_type: reward_info}"""
         session_rewards = {}
-        expected_agents = ['core', 'episodic', 'semantic', 'procedural']
+        _reward_mode_local = str(config.get("reward_mode", "membuilder_qa")).strip().lower()
+        if _reward_mode_local == "memory_r1":
+            expected_agents = ['memory_r1']
+        else:
+            expected_agents = ['core', 'episodic', 'semantic', 'procedural']
         available_agents = list(agents_data.keys())
         is_complete = all(a in available_agents for a in expected_agents)
         
@@ -798,7 +823,8 @@ def compute_score_batch(
                     dominant_agent = None
                     sparse_dropped = True
  
-            sample_gt = agents_data.get("core", {}).get("ground_truth", {})
+            _gt_agent_key = "memory_r1" if _reward_mode_local == "memory_r1" else "core"
+            sample_gt = agents_data.get(_gt_agent_key, {}).get("ground_truth", {})
             qa_questions = sample_gt.get("qa_questions", [])
             state_before_path = sample_gt.get("state_before_path", "")
             
@@ -905,6 +931,18 @@ def compute_score_batch(
                         task_reward = float(task_result.get("task_reward", 0.0))
                         dominant_agent = task_result.get("dominant_agent")
                         print(f"    [OK] Task Reward (pure QA, no CMI): {task_reward:.3f}")
+                    elif reward_mode == "memory_r1":
+                        from training.memory_r1.reward import compute_task_reward_memory_r1
+                        _mr1 = parsed_responses.get("memory_r1", {}) or {}
+                        _inner = _mr1.get("memory_r1", _mr1) if isinstance(_mr1, dict) else {}
+                        ops = _inner.get("operations", []) if isinstance(_inner, dict) else []
+                        task_result = compute_task_reward_memory_r1(
+                            ops, sample_gt, session_id, config
+                        )
+                        task_reward = float(task_result.get("task_reward", 0.0))
+                        _session_qa_reward = task_reward
+                        dominant_agent = task_result.get("dominant_agent")
+                        print(f"    [OK] Task Reward (memory_r1 EM, n_qa={task_result.get('n_qa')}): {task_reward:.3f}")
                     else:
                         task_result = _compute_task_reward_inproc(
                             parsed_responses, sample_gt, session_id, config
@@ -1137,7 +1175,7 @@ def compute_score_batch(
     record_by_index = {r['index']: r for r in reward_records if 'index' in r}
     
     # Map agent_type to integer for downstream grouping (avoids string in tensor batch)
-    _AGENT_TYPE_TO_ID = {"core": 0, "episodic": 1, "semantic": 2, "procedural": 3}
+    _AGENT_TYPE_TO_ID = {"core": 0, "episodic": 1, "semantic": 2, "procedural": 3, "memory_r1": 4}
     
     results = []
     for i in range(n_samples):
@@ -1639,7 +1677,7 @@ def _compute_agent_length_penalty(
     else:
         # Ratio scheme: compare to expert (only for membuilder_qa mode)
         reward_mode = str(config.get("reward_mode", "membuilder_qa")).strip().lower()
-        if reward_mode in ("cmi", "cmi_plus_qa"):
+        if reward_mode in ("cmi", "cmi_plus_qa", "memory_r1"):
             # CMI modes never use expert trajectories for length penalty;
             # force fallback to absolute token budget regardless of data content.
             expert_tokens = 0
@@ -2061,7 +2099,7 @@ def _save_reward_details(
     
     # 按 agent 类型统计
     agent_stats = {'core': [], 'episodic': [], 'semantic': [], 'procedural': []}
-    format_pass_count = 0
+    nonzero_reward_count = 0
     
     for i, (response, gt, reward) in enumerate(zip(solution_strs, ground_truths, rewards)):
         gt_dict = _extract_ground_truth_config(gt) if gt else {}
@@ -2072,7 +2110,7 @@ def _save_reward_details(
                 'length': _count_tokens(response)
             })
         if reward > 0:
-            format_pass_count += 1
+            nonzero_reward_count += 1
     
     # 计算标准差
     reward_std = float(np.std(rewards)) if len(rewards) > 1 else 0.0
@@ -2110,8 +2148,8 @@ def _save_reward_details(
             'std_response_length': length_std,
         },
         'format_stats': {
-            'format_pass_count': format_pass_count,
-            'format_pass_rate': format_pass_count / len(rewards) if rewards else 0.0,
+            'nonzero_reward_count': nonzero_reward_count,
+            'nonzero_reward_rate': nonzero_reward_count / len(rewards) if rewards else 0.0,
         },
         'sparse_reward_stats': {
             'enabled': sparse_config.get('enabled', False) if sparse_config else False,
@@ -2127,7 +2165,7 @@ def _save_reward_details(
                 'std_reward': float(np.std([s['reward'] for s in stats])) if len(stats) > 1 else 0.0,
                 'avg_length': sum(s['length'] for s in stats) / len(stats) if stats else 0.0,
                 'std_length': float(np.std([s['length'] for s in stats])) if len(stats) > 1 else 0.0,
-                'format_pass_rate': sum(1 for s in stats if s['reward'] > 0) / len(stats) if stats else 0.0,
+                'nonzero_reward_rate': sum(1 for s in stats if s['reward'] > 0) / len(stats) if stats else 0.0,
             }
             for agent_type, stats in agent_stats.items()
         },

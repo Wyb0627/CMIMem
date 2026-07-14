@@ -281,7 +281,7 @@ def _validate_cmi_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         cfg["cmi_method"] = "logprob"
 
     # Shaping validation
-    valid_shapings = ("threshold", "gaussian")
+    valid_shapings = ("threshold", "gaussian", "none")
     if cfg.get("cmi_shaping") not in valid_shapings:
         print(f"[CMI_CONFIG] Invalid cmi_shaping='{cfg.get('cmi_shaping')}', "
               f"falling back to 'gaussian'")
