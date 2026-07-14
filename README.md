@@ -95,6 +95,19 @@ Switch via the `ROLLOUT_MODE` environment variable; the two modes are completely
 | **Data** | per-session parquet (`prepare_rl_data_online.py`) | per-session parquet (`prepare_rl_data_agentic.py`) |
 | **Config** | `cmi_grpo.yaml` | `agentic_grpo.yaml` |
 
+### 1.4 Memory-R1 Baseline Mode
+A simplified single-agent baseline following the Memory-R1 paper setup: one flat memory bank with ADD/UPDATE/DELETE/NOOP operations, scored by trajectory-level mean QA accuracy.
+**Key Design**:
+- **Single Flat Bank**: No typed memory (core/episodic/semantic/procedural); all memories are plain text entries keyed by id
+- **Manager Prompt**: Paper Figures 9-10 — decides ADD/UPDATE/DELETE/NONE per retrieved fact
+- **Scoring Modes** (selectable via `MEMORY_R1_EM_MODE`):
+  - `em` (default): Strict normalized Exact Match
+  - `subem`: Substring EM, denser signal
+  - `judge`: LLM-as-judge, same pipeline as the other training modes
+- **No Length Penalty**: Length penalty is force-disabled in memory_r1 mode for a pure trajectory-level scalar
+**Implementation**: `training/memory_r1/` directory
+
+
 ---
 
 ## 2. Code Backbone
@@ -112,6 +125,7 @@ Our code is built based on the original version of [MemBuilder](https://github.c
 MEMBUILDER_REWARD_MODE=cmi           # CMI only (default)
 MEMBUILDER_REWARD_MODE=membuilder_qa # Original QA judge
 MEMBUILDER_REWARD_MODE=cmi_plus_qa   # alpha*CMI + (1-alpha)*QA
+MEMBUILDER_REWARD_MODE=memory_r1     # Memory-R1 baseline (flat memory + EM/judge scoring)
 ```
 
 ### 3.2 Agentic Mode (multi-turn CMI reward)
@@ -136,6 +150,14 @@ ROLLOUT_MODE=agentic python -m verl.trainer.main_ppo --config <your_grpo_config>
 | `CMI_KERNEL_MI_TOP_K` | `10` | Local neighborhood top-k recall count |
 | `CMI_KERNEL_MI_BANDWIDTH` | `auto` | RBF kernel bandwidth (`auto` = Silverman's rule) |
 | `CMI_KERNEL_MI_EMBEDDING_MODEL` | `Qwen3-Embedding-4B` | CMI-specific embedding model path |
+
+### 3.4 Memory-R1 Baseline Configuration
+
+| Environment Variable | Default | Description |
+|---|---|---|
+| `MEMORY_R1_EM_MODE` | `em` | Scoring mode: `em` (normalized Exact Match) / `subem` (substring EM) / `judge` (LLM-as-judge) |
+| `MEMORY_R1_QA_PER_SESSION` | `5` | Number of QA pairs to evaluate per session |
+| `MEMORY_R1_TOP_K` | `8` | Number of retrieved memories per QA question |
 
 ---
 
@@ -282,6 +304,7 @@ bash training/sft/train_example.sh
 | `MEMBUILDER_REWARD_MODE` | `cmi` (default) | Action-Conditioned Local CMI |
 | | `membuilder_qa` | Original QA judge reward |
 | | `cmi_plus_qa` | alpha × CMI + (1-alpha) × QA |
+| | `memory_r1` | Memory-R1 baseline (flat memory + EM/judge) |
 | `ROLLOUT_MODE` | `batch` (default) | Standard 4-agent batch rollout |
 | | `agentic` | Multi-turn agent loop |
 
@@ -382,6 +405,13 @@ MemBuilder/
 │   │   ├── attribution.py             #   Attribution weight computation
 │   │   ├── constraints_checker.py     #   Constraint checker
 │   │   └── start_server.sh            #   Local reward server launcher
+│   │
+│   ├── memory_r1/                     # ★ Memory-R1 baseline module
+│   │   ├── reward.py                  #   Trajectory-level reward (EM / subEM / judge)
+│   │   ├── flat_memory.py             #   Flat memory state + response parsing + EM scoring
+│   │   ├── memory_build.py            #   Build searchable memory from flat list
+│   │   ├── prompts.py                 #   Manager + answer prompt templates
+│   │   └── session_loader.py          #   Session and prior memory state loading
 │   │
 │   ├── rl/
 │   │   └── adrpo.py                   #   ADRPO algorithm implementation
